@@ -116,6 +116,70 @@ func NewUpdateService(options UpdateOptions) *UpdateService {
 	}
 }
 
+func (s *UpdateService) CheckRepoUpdate(ctx context.Context, repo string, force bool) (*UpdateInfo, error) {
+	release, err := s.fetchRepoRelease(ctx, repo)
+	if err != nil {
+		return &UpdateInfo{
+			CurrentVersion: s.currentVersion,
+			LatestVersion:  s.currentVersion,
+			HasUpdate:      false,
+			Warning:        err.Error(),
+			BuildType:      s.buildType,
+		}, nil
+	}
+	latestVersion := strings.TrimPrefix(strings.TrimSpace(release.TagName), "v")
+	hasUpdate := compareVersions(s.currentVersion, latestVersion) < 0
+	return &UpdateInfo{
+		CurrentVersion: s.currentVersion,
+		LatestVersion:  latestVersion,
+		HasUpdate:      hasUpdate,
+		ReleaseInfo:    release.toReleaseInfo("https://github.com/" + repo + "/releases/latest"),
+		BuildType:      s.buildType,
+	}, nil
+}
+
+func (s *UpdateService) fetchRepoRelease(ctx context.Context, repo string) (*githubRelease, error) {
+	apiURL := s.apiBaseURL + "/repos/" + strings.Trim(repo, "/") + "/releases/latest"
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, apiURL, nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Accept", "application/vnd.github+json")
+	req.Header.Set("X-GitHub-Api-Version", "2022-11-28")
+	req.Header.Set("User-Agent", "chatgpt2api-updater")
+	if s.githubToken != "" {
+		req.Header.Set("Authorization", "Bearer "+s.githubToken)
+	}
+
+	resp, err := s.httpClient.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return nil, githubAPIStatusError(resp, repo)
+	}
+	var release githubRelease
+	if err := json.NewDecoder(resp.Body).Decode(&release); err != nil {
+		return nil, err
+	}
+	return &release, nil
+}
+
+func (r *githubRelease) toReleaseInfo(htmlURL string) *ReleaseInfo {
+	assets := make([]Asset, 0, len(r.Assets))
+	for _, a := range r.Assets {
+		assets = append(assets, Asset{Name: a.Name, DownloadURL: a.BrowserDownloadURL, Size: a.Size})
+	}
+	return &ReleaseInfo{
+		Name:        r.Name,
+		Body:        r.Body,
+		PublishedAt: r.PublishedAt,
+		HTMLURL:     htmlURL,
+		Assets:      assets,
+	}
+}
+
 func (s *UpdateService) CheckUpdate(ctx context.Context, force bool) (*UpdateInfo, error) {
 	if !force {
 		if cached := s.cachedInfo(); cached != nil {

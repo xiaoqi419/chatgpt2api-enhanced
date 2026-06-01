@@ -45,12 +45,22 @@ func (a *App) handleAdminSystem(w http.ResponseWriter, r *http.Request) {
 			w.WriteHeader(http.StatusMethodNotAllowed)
 			return
 		}
-		info, err := a.update.CheckUpdate(r.Context(), r.URL.Query().Get("force") == "true")
+		force := r.URL.Query().Get("force") == "true"
+		info, err := a.update.CheckUpdate(r.Context(), force)
 		if err != nil {
 			util.WriteError(w, http.StatusBadGateway, err.Error())
 			return
 		}
-		util.WriteJSON(w, http.StatusOK, info)
+		// Also check the Python version repo
+		pyInfo, pyErr := a.update.CheckRepoUpdate(r.Context(), "basketikun/chatgpt2api", force)
+		response := map[string]any{
+			"go":     info,
+			"python": pyInfo,
+		}
+		if pyErr != nil {
+			response["python_error"] = pyErr.Error()
+		}
+		util.WriteJSON(w, http.StatusOK, response)
 	case base + "/update":
 		if r.Method != http.MethodPost {
 			w.WriteHeader(http.StatusMethodNotAllowed)
