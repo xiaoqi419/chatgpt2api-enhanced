@@ -1760,6 +1760,147 @@ func sanitizeSub2Servers(servers []map[string]any) []map[string]any {
 	return out
 }
 
+func (a *App) handleEditableFiles(w http.ResponseWriter, r *http.Request) {
+	identity, ok := a.requireIdentity(w, r, "")
+	if !ok {
+		return
+	}
+	if r.URL.Path == "/api/editable-files/ppt" && r.Method == http.MethodPost {
+		body, _ := readJSONMap(r)
+		baseURL := a.resolveImageBaseURL(r)
+		result, err := a.editableFiles.Submit(identity.Map(), "ppt", util.Clean(body["prompt"]), nil, baseURL)
+		if err != nil {
+			util.WriteError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		util.WriteJSON(w, http.StatusOK, result)
+		return
+	}
+	if r.URL.Path == "/api/editable-files/psd" && r.Method == http.MethodPost {
+		body, _ := readJSONMap(r)
+		baseURL := a.resolveImageBaseURL(r)
+		result, err := a.editableFiles.Submit(identity.Map(), "psd", util.Clean(body["prompt"]), nil, baseURL)
+		if err != nil {
+			util.WriteError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		util.WriteJSON(w, http.StatusOK, result)
+		return
+	}
+	if r.Method == http.MethodGet {
+		ids := strings.Split(r.URL.Query().Get("ids"), ",")
+		util.WriteJSON(w, http.StatusOK, a.editableFiles.List(identity.Map(), ids))
+		return
+	}
+	w.WriteHeader(http.StatusMethodNotAllowed)
+}
+
+func (a *App) handleImageTags(w http.ResponseWriter, r *http.Request) {
+	identity, ok := a.requireIdentity(w, r, "")
+	if !ok {
+		return
+	}
+	ownerID := util.Clean(identity.OwnerID)
+	if ownerID == "" {
+		util.WriteError(w, http.StatusForbidden, "image tags require a bound user account")
+		return
+	}
+	base := "/api/image-tags"
+	if r.URL.Path == base {
+		switch r.Method {
+		case http.MethodGet:
+			items, err := a.imageTags.List(ownerID)
+			if err != nil {
+				util.WriteError(w, http.StatusInternalServerError, err.Error())
+				return
+			}
+			util.WriteJSON(w, http.StatusOK, map[string]any{"items": items})
+		case http.MethodPost:
+			body, _ := readJSONMap(r)
+			item, err := a.imageTags.Upsert(ownerID, body)
+			if err != nil {
+				util.WriteError(w, http.StatusBadRequest, err.Error())
+				return
+			}
+			util.WriteJSON(w, http.StatusOK, map[string]any{"item": item})
+		default:
+			w.WriteHeader(http.StatusMethodNotAllowed)
+		}
+		return
+	}
+	parts := splitPath(r.URL.Path)
+	if len(parts) == 4 && parts[0] == "api" && parts[1] == "image-tags" && r.Method == http.MethodDelete {
+		deleted, _ := a.imageTags.Delete(ownerID, parts[3])
+		if !deleted {
+			util.WriteError(w, http.StatusNotFound, "tag not found")
+			return
+		}
+		util.WriteJSON(w, http.StatusOK, map[string]any{"ok": true})
+		return
+	}
+	http.NotFound(w, r)
+}
+
+func (a *App) handleBackup(w http.ResponseWriter, r *http.Request) {
+	if _, ok := a.requireIdentity(w, r, ""); !ok {
+		return
+	}
+	switch r.Method {
+	case http.MethodGet:
+		items, err := a.backup.List()
+		if err != nil {
+			util.WriteError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		util.WriteJSON(w, http.StatusOK, map[string]any{"items": items})
+	case http.MethodPost:
+		path, err := a.backup.Create()
+		if err != nil {
+			util.WriteError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		util.WriteJSON(w, http.StatusOK, map[string]any{"path": path})
+	default:
+		w.WriteHeader(http.StatusMethodNotAllowed)
+	}
+}
+
+func (a *App) handleOAuth(w http.ResponseWriter, r *http.Request) {
+	parts := splitPath(r.URL.Path)
+	if len(parts) < 3 || parts[0] != "api" || parts[1] != "oauth" {
+		http.NotFound(w, r)
+		return
+	}
+	if parts[2] == "providers" {
+		util.WriteJSON(w, http.StatusOK, map[string]any{"items": a.oauthLogin.ListProviders()})
+		return
+	}
+	if parts[2] == "start" && len(parts) > 3 && r.Method == http.MethodGet {
+		providerName := parts[3]
+		state := util.NewHex(16)
+		authURL, err := a.oauthLogin.GenerateAuthURL(providerName, state)
+		if err != nil {
+			util.WriteError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		http.Redirect(w, r, authURL, http.StatusFound)
+		return
+	}
+	if parts[2] == "callback" && len(parts) > 3 && r.Method == http.MethodGet {
+		providerName := parts[3]
+		state := r.URL.Query().Get("state")
+		code := r.URL.Query().Get("code")
+		tokens, err := a.oauthLogin.ExchangeCode(providerName, state, code)
+		if err != nil {
+			util.WriteError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		util.WriteJSON(w, http.StatusOK, tokens)
+		return
+	}
+	http.NotFound(w, r)
+}
+
 func splitPath(path string) []string {
 	trimmed := strings.Trim(path, "/")
 	if trimmed == "" {

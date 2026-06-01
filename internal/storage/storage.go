@@ -49,6 +49,22 @@ func NewBackendFromEnv(dataDir string) (Backend, error) {
 		backendType = "sqlite"
 	}
 	switch backendType {
+	case "git":
+		repoURL := strings.TrimSpace(os.Getenv("GIT_REPO_URL"))
+		token := strings.TrimSpace(os.Getenv("GIT_TOKEN"))
+		branch := strings.TrimSpace(os.Getenv("GIT_BRANCH"))
+		filePath := strings.TrimSpace(os.Getenv("GIT_FILE_PATH"))
+		authKeysFilePath := strings.TrimSpace(os.Getenv("GIT_AUTH_KEYS_FILE_PATH"))
+		if branch == "" {
+			branch = "main"
+		}
+		if filePath == "" {
+			filePath = "accounts.json"
+		}
+		if authKeysFilePath == "" {
+			authKeysFilePath = "auth_keys.json"
+		}
+		return NewGitStorageBackend(repoURL, token, branch, filePath, authKeysFilePath, filepath.Join(dataDir, "git_cache"))
 	case "sqlite", "postgres", "postgresql", "mysql", "database":
 		dsn := strings.TrimSpace(os.Getenv("DATABASE_URL"))
 		if dsn == "" {

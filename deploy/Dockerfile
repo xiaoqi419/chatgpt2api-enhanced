@@ -30,6 +30,8 @@ FROM --platform=$BUILDPLATFORM ${GO_IMAGE} AS go-build
 
 WORKDIR /src
 
+ENV GOPROXY=https://goproxy.cn,direct
+
 COPY go.mod go.sum ./
 RUN --mount=type=cache,target=/go/pkg/mod,sharing=locked go mod download
 

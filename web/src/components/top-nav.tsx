@@ -7,6 +7,7 @@ import { Link, NavLink, useLocation, useNavigate } from "react-router-dom";
 
 import { AnnouncementNotifications } from "@/components/announcement-banner";
 import { ImageTaskQueue } from "@/components/image-task-queue";
+import { VersionReleaseDialog } from "@/components/version-release-dialog";
 import webConfig from "@/constants/common-env";
 import {
   AUTH_SESSION_CHANGE_EVENT,
@@ -443,6 +444,7 @@ export function TopNav() {
             pathname={pathname}
             onLogout={handleLogout}
           />
+          <VersionReleaseDialog />
         </div>
       </div>
     </header>

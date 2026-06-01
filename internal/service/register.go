@@ -12,7 +12,6 @@ import (
 	"math"
 	mathrand "math/rand"
 	"net/http"
-	"net/http/cookiejar"
 	"net/url"
 	"strconv"
 	"strings"
@@ -68,12 +67,13 @@ type registerWorkerResult struct {
 }
 
 type registerWorker struct {
-	service  *RegisterService
-	index    int
-	config   map[string]any
-	mail     map[string]any
-	client   *http.Client
-	deviceID string
+	service      *RegisterService
+	index        int
+	config       map[string]any
+	mail         map[string]any
+	client       *http.Client
+	deviceID     string
+	codeVerifier string
 }
 
 type registerSentinelTokenGenerator struct {
@@ -287,25 +287,11 @@ func newRegisterWorker(service *RegisterService, index int, config map[string]an
 }
 
 func registerHTTPClient(proxy string, timeout time.Duration, deviceID string) (*http.Client, error) {
-	jar, err := cookiejar.New(nil)
-	if err != nil {
-		return nil, err
-	}
-	transport := transportForProxy("")
-	if strings.TrimSpace(proxy) != "" {
-		parsed, parseErr := url.Parse(proxy)
-		if parseErr != nil {
-			return nil, parseErr
-		}
-		if parsed.Host == "" {
-			return nil, fmt.Errorf("invalid proxy url")
-		}
-		transport = transportForProxyURL(parsed)
-	}
-	client := &http.Client{Timeout: timeout, Transport: transport, Jar: jar}
+	// Use browser-like TLS fingerprinting to bypass Cloudflare
+	client := browserHTTPClient(proxy, timeout)
 	authURL, _ := url.Parse(registerAuthBase)
-	if authURL != nil {
-		jar.SetCookies(authURL, []*http.Cookie{
+	if authURL != nil && client.Jar != nil {
+		client.Jar.SetCookies(authURL, []*http.Cookie{
 			{Name: "oai-did", Value: deviceID, Domain: ".auth.openai.com", Path: "/"},
 			{Name: "oai-did", Value: deviceID, Domain: "auth.openai.com", Path: "/"},
 		})
@@ -353,10 +339,11 @@ func (w *registerWorker) run(ctx context.Context) (map[string]any, error) {
 	if err := w.validateOTP(ctx, code); err != nil {
 		return nil, err
 	}
-	if err := w.createAccount(ctx, firstName+" "+lastName, registerRandomBirthdate()); err != nil {
+	authCode, err := w.createAccount(ctx, firstName+" "+lastName, registerRandomBirthdate())
+	if err != nil {
 		return nil, err
 	}
-	tokens, err := w.loginAndExchangeTokens(ctx, email, password, mailbox)
+	tokens, err := w.exchangeRegistrationTokens(ctx, authCode)
 	if err != nil {
 		return nil, err
 	}
@@ -399,14 +386,27 @@ func registerFailedToCreateAccount(payload map[string]any) bool {
 	return util.Clean(payload["message"]) == "Failed to create account. Please try again."
 }
 
+func registerIsCloudflareChallenge(payload map[string]any) bool {
+	text := strings.ToLower(util.Clean(payload["body"]))
+	server := strings.ToLower(util.Clean(payload["server"]))
+	return strings.Contains(server, "cloudflare") ||
+		strings.Contains(text, "challenges.cloudflare.com") ||
+		strings.Contains(text, "<title>just a moment")
+}
+
 func (w *registerWorker) platformAuthorize(ctx context.Context, email string) error {
 	w.step("开始 platform authorize")
-	values := registerAuthorizeParams(email, w.deviceID, registerRandomToken(), registerRandomToken(), registerPKCEChallenge())
+	w.codeVerifier, _ = generateRegisterPKCE()
+	codeChallenge := sha256.Sum256([]byte(w.codeVerifier))
+	values := registerAuthorizeParams(email, w.deviceID, registerRandomToken(), registerRandomToken(), base64.RawURLEncoding.EncodeToString(codeChallenge[:]))
 	status, payload, err := w.request(ctx, http.MethodGet, registerAuthBase+"/api/accounts/authorize?"+values.Encode(), nil, w.navigateHeaders(registerPlatformBase+"/"), true)
 	if err != nil {
 		return err
 	}
 	if status != http.StatusOK {
+		if registerIsCloudflareChallenge(payload) {
+			return fmt.Errorf("被 Cloudflare 拦截，请更换 IP 重试")
+		}
 		return fmt.Errorf("platform_authorize_http_%d%s", status, registerAuthorizeErrorDetail(payload))
 	}
 	w.step("platform authorize 完成")
@@ -460,12 +460,12 @@ func (w *registerWorker) validateOTP(ctx context.Context, code string) error {
 	return nil
 }
 
-func (w *registerWorker) createAccount(ctx context.Context, name, birthdate string) error {
+func (w *registerWorker) createAccount(ctx context.Context, name, birthdate string) (string, error) {
 	w.step("开始创建账号资料")
 	headers := w.jsonHeaders(registerAuthBase + "/about-you")
 	token, err := w.buildSentinelToken(ctx, "oauth_create_account")
 	if err != nil {
-		return err
+		return "", err
 	}
 	headers["openai-sentinel-token"] = token
 	status, payload, err := w.request(ctx, http.MethodPost, registerAuthBase+"/api/accounts/create_account", map[string]any{
@@ -473,118 +473,58 @@ func (w *registerWorker) createAccount(ctx context.Context, name, birthdate stri
 		"birthdate": birthdate,
 	}, headers, true)
 	if err != nil {
-		return err
+		return "", err
 	}
 	if status != http.StatusOK && status != http.StatusFound {
 		if registerFailedToCreateAccount(payload) {
 			w.step("创建账号失败提示: 邮箱域名很可能因滥用被封禁，请更换邮箱域名")
 		}
-		return fmt.Errorf("create_account_http_%d%s", status, registerResponseDetail(payload))
+		return "", fmt.Errorf("create_account_http_%d%s", status, registerResponseDetail(payload))
+	}
+	authCode := registerOAuthCode(util.Clean(payload["continue_url"]))
+	if authCode == "" {
+		return "", fmt.Errorf("create_account response missing authorization code in continue_url")
 	}
 	w.step("创建账号资料完成")
-	return nil
+	return authCode, nil
 }
 
-func (w *registerWorker) loginAndExchangeTokens(ctx context.Context, email, password string, mailbox map[string]any) (map[string]any, error) {
-	w.step("开始独立登录换 token")
-	codeVerifier, codeChallenge := generateRegisterPKCE()
-	values := registerAuthorizeParams(email, w.deviceID, registerRandomToken(), registerRandomToken(), codeChallenge)
-	authorizeLogin := func() error {
-		status, _, err := w.request(ctx, http.MethodGet, registerAuthBase+"/api/accounts/authorize?"+values.Encode(), nil, w.navigateHeaders(registerPlatformBase+"/"), true)
-		if err != nil {
-			return err
-		}
-		if status != http.StatusOK {
-			return fmt.Errorf("platform_login_authorize_http_%d", status)
-		}
-		return nil
+func (w *registerWorker) exchangeRegistrationTokens(ctx context.Context, authCode string) (map[string]any, error) {
+	w.step("开始换 token")
+	headers := map[string]string{
+		"Accept":             "*/*",
+		"Accept-Language":    "zh-CN,zh;q=0.9",
+		"auth0-client":       registerPlatformAuth0Client,
+		"Cache-Control":      "no-cache",
+		"Content-Type":       "application/json",
+		"Origin":             registerPlatformBase,
+		"Pragma":             "no-cache",
+		"priority":           "u=1, i",
+		"Referer":            registerPlatformBase + "/",
+		"sec-ch-ua":          registerSecCHUA,
+		"sec-ch-ua-mobile":   "?0",
+		"sec-ch-ua-platform": `"Windows"`,
+		"sec-fetch-dest":     "empty",
+		"sec-fetch-mode":     "cors",
+		"sec-fetch-site":     "same-site",
+		"User-Agent":         registerUserAgent,
 	}
-	if err := authorizeLogin(); err != nil {
-		return nil, err
-	}
-	w.step("登录 authorize 完成")
-
-	status, payload, err := w.submitLoginEmail(ctx, email)
-	if err != nil {
-		return nil, err
-	}
-	if status == http.StatusConflict {
-		w.step("邮箱提交 invalid_state，重新 authorize 后重试")
-		if err := authorizeLogin(); err != nil {
-			return nil, err
-		}
-		status, payload, err = w.submitLoginEmail(ctx, email)
-		if err != nil {
-			return nil, err
-		}
-	}
-	if status != http.StatusOK {
-		return nil, fmt.Errorf("email_submit_http_%d%s", status, registerResponseDetail(payload))
-	}
-	w.step("邮箱提交完成")
-
-	headers := w.jsonHeaders(registerAuthBase + "/log-in/password")
-	token, err := w.buildSentinelToken(ctx, "password_verify")
-	if err != nil {
-		return nil, err
-	}
-	headers["openai-sentinel-token"] = token
-	status, payload, err = w.request(ctx, http.MethodPost, registerAuthBase+"/api/accounts/password/verify", map[string]any{
-		"password": password,
-	}, headers, false)
-	if err != nil {
-		return nil, err
-	}
-	if status != http.StatusOK {
-		return nil, fmt.Errorf("password_verify_http_%d", status)
-	}
-	w.step("密码校验完成")
-	continueURL := util.Clean(payload["continue_url"])
-	page := util.StringMap(payload["page"])
-	if util.Clean(page["type"]) == "email_otp_verification" || strings.Contains(continueURL, "email-verification") || strings.Contains(continueURL, "email-otp") {
-		w.step("独立登录需要邮箱验证码")
-		code, waitErr := waitRegisterCode(ctx, w.mail, mailbox)
-		if waitErr != nil {
-			return nil, waitErr
-		}
-		if code == "" {
-			return nil, fmt.Errorf("independent login waiting for verification code timed out")
-		}
-		otpPayload, otpErr := w.validateOTPCode(ctx, code)
-		if otpErr != nil {
-			return nil, otpErr
-		}
-		if next := util.Clean(otpPayload["continue_url"]); next != "" {
-			continueURL = next
-		}
-		w.step("独立登录验证码校验完成")
-	}
-	if continueURL == "" {
-		continueURL = registerAuthBase + "/sign-in-with-chatgpt/codex/consent"
-	}
-	code, err := w.followConsentForCode(ctx, continueURL)
-	if err != nil {
-		return nil, err
-	}
-	if code == "" {
-		return nil, fmt.Errorf("token exchange callback code not found")
-	}
-	status, tokenPayload, err := w.requestForm(ctx, registerAuthBase+"/oauth/token", url.Values{
-		"grant_type":    []string{"authorization_code"},
-		"code":          []string{code},
-		"redirect_uri":  []string{registerPlatformOAuthRedirectURI},
-		"client_id":     []string{registerPlatformOAuthClientID},
-		"code_verifier": []string{codeVerifier},
-	})
+	status, payload, err := w.request(ctx, http.MethodPost, registerAuthBase+"/api/accounts/oauth/token", map[string]any{
+		"client_id":     registerPlatformOAuthClientID,
+		"code_verifier": w.codeVerifier,
+		"grant_type":    "authorization_code",
+		"code":          authCode,
+		"redirect_uri":  registerPlatformOAuthRedirectURI,
+	}, headers, true)
 	if err != nil {
 		return nil, err
 	}
 	if status != http.StatusOK {
 		return nil, fmt.Errorf("oauth_token_http_%d", status)
 	}
-	accessToken := util.Clean(tokenPayload["access_token"])
-	refreshToken := util.Clean(tokenPayload["refresh_token"])
-	idToken := util.Clean(tokenPayload["id_token"])
+	accessToken := util.Clean(payload["access_token"])
+	refreshToken := util.Clean(payload["refresh_token"])
+	idToken := util.Clean(payload["id_token"])
 	if accessToken == "" || refreshToken == "" || idToken == "" {
 		return nil, fmt.Errorf("token exchange response missing access_token, refresh_token, or id_token")
 	}
@@ -594,63 +534,6 @@ func (w *registerWorker) loginAndExchangeTokens(ctx context.Context, email, pass
 		"refresh_token": refreshToken,
 		"id_token":      idToken,
 	}, nil
-}
-
-func (w *registerWorker) submitLoginEmail(ctx context.Context, email string) (int, map[string]any, error) {
-	w.step("开始提交邮箱")
-	headers := w.jsonHeaders(registerAuthBase + "/log-in?usernameKind=email")
-	token, err := w.buildSentinelToken(ctx, "authorize_continue")
-	if err != nil {
-		return 0, nil, err
-	}
-	headers["openai-sentinel-token"] = token
-	return w.request(ctx, http.MethodPost, registerAuthBase+"/api/accounts/authorize/continue", map[string]any{
-		"username": map[string]any{
-			"kind":  "email",
-			"value": email,
-		},
-	}, headers, false)
-}
-
-func (w *registerWorker) followConsentForCode(ctx context.Context, continueURL string) (string, error) {
-	current := continueURL
-	if strings.HasPrefix(current, "/") {
-		current = registerAuthBase + current
-	}
-	noRedirect := *w.client
-	noRedirect.CheckRedirect = func(req *http.Request, via []*http.Request) error {
-		return http.ErrUseLastResponse
-	}
-	for i := 0; i < 10; i++ {
-		req, err := http.NewRequestWithContext(ctx, http.MethodGet, current, nil)
-		if err != nil {
-			return "", err
-		}
-		for key, value := range w.navigateHeaders(current) {
-			req.Header.Set(key, value)
-		}
-		resp, err := noRedirect.Do(req)
-		if err != nil {
-			return "", err
-		}
-		resp.Body.Close()
-		if code := registerOAuthCode(resp.Request.URL.String()); code != "" {
-			return code, nil
-		}
-		location := strings.TrimSpace(resp.Header.Get("Location"))
-		if code := registerOAuthCode(location); code != "" {
-			return code, nil
-		}
-		if location == "" || (resp.StatusCode < 300 || resp.StatusCode >= 400) {
-			break
-		}
-		next, err := resolveRegisterLocation(current, location)
-		if err != nil {
-			return "", err
-		}
-		current = next
-	}
-	return w.selectWorkspaceForConsentCode(ctx, continueURL)
 }
 
 func (w *registerWorker) validateOTPCode(ctx context.Context, code string) (map[string]any, error) {
@@ -675,100 +558,6 @@ func (w *registerWorker) validateOTPCode(ctx context.Context, code string) (map[
 		return nil, fmt.Errorf("validate_otp_http_%d", status)
 	}
 	return payload, nil
-}
-
-func (w *registerWorker) selectWorkspaceForConsentCode(ctx context.Context, consentURL string) (string, error) {
-	workspaceID := w.authSessionWorkspaceID()
-	if workspaceID == "" {
-		return "", nil
-	}
-	if strings.HasPrefix(consentURL, "/") {
-		consentURL = registerAuthBase + consentURL
-	}
-	headers := w.jsonHeaders(consentURL)
-	status, wsPayload, wsHeaders, err := w.requestDetailed(ctx, http.MethodPost, registerAuthBase+"/api/accounts/workspace/select", map[string]any{
-		"workspace_id": workspaceID,
-	}, headers, false)
-	if err != nil {
-		return "", err
-	}
-	if code := registerOAuthCode(wsHeaders.Get("Location")); code != "" {
-		return code, nil
-	}
-	if code := registerOAuthCode(util.Clean(wsPayload["continue_url"])); code != "" {
-		return code, nil
-	}
-	if status < 200 || status >= 400 {
-		return "", fmt.Errorf("workspace_select_http_%d", status)
-	}
-	data := util.StringMap(wsPayload["data"])
-	orgs := util.AsMapSlice(data["orgs"])
-	if len(orgs) == 0 {
-		return "", nil
-	}
-	orgID := util.Clean(orgs[0]["id"])
-	if orgID == "" {
-		return "", nil
-	}
-	orgBody := map[string]any{"org_id": orgID}
-	if projects := util.AsMapSlice(orgs[0]["projects"]); len(projects) > 0 {
-		if projectID := util.Clean(projects[0]["id"]); projectID != "" {
-			orgBody["project_id"] = projectID
-		}
-	}
-	orgReferer := firstNonEmpty(util.Clean(wsPayload["continue_url"]), consentURL)
-	status, orgPayload, orgHeaders, err := w.requestDetailed(ctx, http.MethodPost, registerAuthBase+"/api/accounts/organization/select", orgBody, w.jsonHeaders(orgReferer), false)
-	if err != nil {
-		return "", err
-	}
-	if code := registerOAuthCode(orgHeaders.Get("Location")); code != "" {
-		return code, nil
-	}
-	if code := registerOAuthCode(util.Clean(orgPayload["continue_url"])); code != "" {
-		return code, nil
-	}
-	if status < 200 || status >= 400 {
-		return "", fmt.Errorf("organization_select_http_%d", status)
-	}
-	return "", nil
-}
-
-func (w *registerWorker) authSessionWorkspaceID() string {
-	if w.client == nil || w.client.Jar == nil {
-		return ""
-	}
-	authURL, err := url.Parse(registerAuthBase)
-	if err != nil {
-		return ""
-	}
-	var raw string
-	for _, cookie := range w.client.Jar.Cookies(authURL) {
-		if cookie.Name == "oai-client-auth-session" {
-			raw = cookie.Value
-			break
-		}
-	}
-	if raw == "" {
-		return ""
-	}
-	firstPart := strings.Split(raw, ".")[0]
-	padding := len(firstPart) % 4
-	if padding != 0 {
-		firstPart += strings.Repeat("=", 4-padding)
-	}
-	data, err := base64.URLEncoding.DecodeString(firstPart)
-	if err != nil {
-		return ""
-	}
-	var payload map[string]any
-	if json.Unmarshal(data, &payload) != nil {
-		return ""
-	}
-	workspaces := util.AsMapSlice(payload["workspaces"])
-	if len(workspaces) == 0 {
-		return ""
-	}
-	return util.Clean(workspaces[0]["id"])
 }
 
 func (w *registerWorker) buildSentinelToken(ctx context.Context, flow string) (string, error) {
@@ -908,42 +697,6 @@ func (w *registerWorker) requestDetailed(ctx context.Context, method, target str
 		return 0, nil, nil, lastErr
 	}
 	return 0, nil, nil, fmt.Errorf("request failed")
-}
-
-func (w *registerWorker) requestForm(ctx context.Context, target string, form url.Values) (int, map[string]any, error) {
-	body := []byte(form.Encode())
-	headers := map[string]string{
-		"Content-Type": "application/x-www-form-urlencoded",
-		"Accept":       "application/json",
-		"User-Agent":   registerUserAgent,
-	}
-	var lastErr error
-	for attempt := 0; attempt < 3; attempt++ {
-		req, err := http.NewRequestWithContext(ctx, http.MethodPost, target, bytes.NewReader(body))
-		if err != nil {
-			return 0, nil, err
-		}
-		for key, value := range headers {
-			req.Header.Set(key, value)
-		}
-		resp, err := w.client.Do(req)
-		if err != nil {
-			lastErr = err
-			if attempt < 2 {
-				time.Sleep(time.Second)
-				continue
-			}
-			return 0, nil, err
-		}
-		defer resp.Body.Close()
-		payload := map[string]any{}
-		_ = util.DecodeJSON(resp.Body, &payload)
-		return resp.StatusCode, payload, nil
-	}
-	if lastErr != nil {
-		return 0, nil, lastErr
-	}
-	return 0, nil, fmt.Errorf("form request failed")
 }
 
 func (w *registerWorker) navigateHeaders(referer string) map[string]string {
@@ -1297,11 +1050,6 @@ func registerRandomToken() string {
 	return util.RandomTokenURL(24)
 }
 
-func registerPKCEChallenge() string {
-	_, challenge := generateRegisterPKCE()
-	return challenge
-}
-
 func generateRegisterPKCE() (string, string) {
 	buf := make([]byte, 64)
 	_, _ = rand.Read(buf)
@@ -1341,18 +1089,6 @@ func registerOAuthCode(target string) string {
 		return ""
 	}
 	return strings.TrimSpace(parsed.Query().Get("code"))
-}
-
-func resolveRegisterLocation(baseURL, location string) (string, error) {
-	base, err := url.Parse(baseURL)
-	if err != nil {
-		return "", err
-	}
-	next, err := url.Parse(location)
-	if err != nil {
-		return "", err
-	}
-	return base.ResolveReference(next).String(), nil
 }
 
 func newRegisterSentinelTokenGenerator(deviceID, userAgent string) *registerSentinelTokenGenerator {

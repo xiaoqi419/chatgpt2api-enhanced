@@ -56,9 +56,14 @@ type App struct {
 	cpaImport  *service.CPAImportService
 	sub2       *service.Sub2APIConfig
 	sub2Import *service.Sub2APIService
-	register   *service.RegisterService
-	update     *service.UpdateService
-	cancel     context.CancelFunc
+	register       *service.RegisterService
+	update         *service.UpdateService
+	editableFiles  *service.EditableFileTaskService
+	imageTags      *service.ImageTagsService
+	backup         *service.BackupService
+	contentFilter  *service.ContentFilterService
+	oauthLogin     *service.OAuthLoginService
+	cancel         context.CancelFunc
 }
 
 func NewApp() (*App, error) {
@@ -100,6 +105,14 @@ func NewApp() (*App, error) {
 	app.cpaImport = service.NewCPAImportService(app.cpa, accounts, proxy)
 	app.sub2Import = service.NewSub2APIService(app.sub2, accounts)
 	app.register = service.NewRegisterService(accounts, storageBackend)
+	app.editableFiles = service.NewEditableFileTaskService(cfg.DataDir,
+		func() ([]map[string]any, error) { return accounts.ListAccounts(), nil },
+		nil,
+	)
+	app.imageTags = service.NewImageTagsService(documentStore)
+	app.backup = service.NewBackupService(cfg.DataDir, filepath.Join(cfg.DataDir, "backups"), 10)
+	app.oauthLogin = service.NewOAuthLoginService(documentStore)
+
 	app.tasks = service.NewStoredImageTaskService(storageBackend,
 		func(ctx context.Context, identity service.Identity, payload map[string]any) (map[string]any, error) {
 			return app.runLoggedImageTask(ctx, identity, payload, "/api/creation-tasks/image-generations", "文生图", func(ctx context.Context, payload map[string]any) (map[string]any, error) {
@@ -209,7 +222,17 @@ func (a *App) handleImageEdits(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	body, images, err := readMultipartImageBody(r)
+
+	var body map[string]any
+	var images []protocol.UploadedImage
+	var err error
+
+	contentType := strings.ToLower(strings.TrimSpace(r.Header.Get("Content-Type")))
+	if strings.HasPrefix(contentType, "application/json") {
+		body, images, err = readJSONImageEditsBody(r)
+	} else {
+		body, images, err = readMultipartImageBody(r)
+	}
 	if err != nil {
 		util.WriteError(w, http.StatusBadRequest, err.Error())
 		return
@@ -1338,6 +1361,63 @@ func readMultipartImageBody(r *http.Request) (map[string]any, []protocol.Uploade
 		}
 	}
 	return body, images, nil
+}
+
+func readJSONImageEditsBody(r *http.Request) (map[string]any, []protocol.UploadedImage, error) {
+	body, err := readJSONMap(r)
+	if err != nil {
+		return nil, nil, err
+	}
+	body["response_format"] = firstNonEmpty(util.Clean(body["response_format"]), "b64_json")
+	body["stream"] = util.ToBool(body["stream"])
+
+	rawImages, _ := body["images"].([]any)
+	if len(rawImages) == 0 {
+		return body, nil, nil
+	}
+
+	images := make([]protocol.UploadedImage, 0, len(rawImages))
+	client := &http.Client{Timeout: 30 * time.Second}
+	for _, item := range rawImages {
+		imgMap, ok := item.(map[string]any)
+		if !ok {
+			continue
+		}
+		imageURL := util.Clean(imgMap["image_url"])
+		if imageURL == "" {
+			continue
+		}
+		resp, err := client.Get(imageURL)
+		if err != nil {
+			return nil, nil, fmt.Errorf("failed to download image from URL: %s: %w", imageURL, err)
+		}
+		data, err := io.ReadAll(io.LimitReader(resp.Body, 50<<20))
+		resp.Body.Close()
+		if err != nil {
+			return nil, nil, fmt.Errorf("failed to read image from URL: %s: %w", imageURL, err)
+		}
+		if len(data) == 0 {
+			continue
+		}
+		contentType := resp.Header.Get("Content-Type")
+		if contentType == "" {
+			contentType = "image/png"
+		}
+		images = append(images, protocol.UploadedImage{
+			Data:        data,
+			ContentType: contentType,
+			Filename:    extractFileName(imageURL),
+		})
+	}
+	return body, images, nil
+}
+
+func extractFileName(imageURL string) string {
+	idx := strings.LastIndexByte(imageURL, '/')
+	if idx >= 0 && idx < len(imageURL)-1 {
+		return imageURL[idx+1:]
+	}
+	return "image.png"
 }
 
 func firstForm(form *multipart.Form, key string) string {

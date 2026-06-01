@@ -2,12 +2,9 @@ package service
 
 import (
 	"context"
-	"encoding/base64"
 	"encoding/json"
 	"io"
 	"net/http"
-	"net/http/cookiejar"
-	"net/url"
 	"strings"
 	"testing"
 	"time"
@@ -112,91 +109,52 @@ func TestValidateOTPCodeRetriesWithSentinelToken(t *testing.T) {
 	}
 }
 
-func TestSelectWorkspaceForConsentCodeUsesCookieFallback(t *testing.T) {
-	jar, err := cookiejar.New(nil)
-	if err != nil {
-		t.Fatalf("cookiejar.New() error = %v", err)
-	}
-	authURL, _ := url.Parse(registerAuthBase)
-	cookiePayload, _ := json.Marshal(map[string]any{"workspaces": []map[string]any{{"id": "workspace-1"}}})
-	jar.SetCookies(authURL, []*http.Cookie{
-		{Name: "oai-client-auth-session", Value: base64.RawURLEncoding.EncodeToString(cookiePayload) + ".rest", Path: "/"},
-	})
+func TestExchangeRegistrationTokens(t *testing.T) {
 	worker := &registerWorker{
-		deviceID: "device-1",
-		client: &http.Client{Jar: jar, Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
-			switch req.URL.Path {
-			case "/api/accounts/workspace/select":
-				return registerJSONResponse(req, http.StatusOK, `{"data":{"orgs":[{"id":"org-1","projects":[{"id":"project-1"}]}]},"continue_url":"https://auth.openai.com/continue"}`), nil
-			case "/api/accounts/organization/select":
-				resp := registerJSONResponse(req, http.StatusFound, `{}`)
-				resp.Header.Set("Location", registerPlatformOAuthRedirectURI+"?code=callback-code&state=state")
-				return resp, nil
-			default:
-				t.Fatalf("unexpected request path: %s", req.URL.Path)
-				return nil, nil
-			}
-		})},
-	}
-
-	code, err := worker.selectWorkspaceForConsentCode(context.Background(), registerAuthBase+"/sign-in-with-chatgpt/codex/consent")
-	if err != nil {
-		t.Fatalf("selectWorkspaceForConsentCode() error = %v", err)
-	}
-	if code != "callback-code" {
-		t.Fatalf("code = %q", code)
-	}
-}
-
-func TestLoginAndExchangeTokensSubmitsEmailBeforePassword(t *testing.T) {
-	var sequence []string
-	worker := &registerWorker{
-		service:  &RegisterService{},
-		deviceID: "device-1",
+		deviceID:     "device-1",
+		codeVerifier: "test-verifier",
 		client: &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
-			switch req.URL.Path {
-			case "/api/accounts/authorize":
-				sequence = append(sequence, "authorize")
-				return registerJSONResponse(req, http.StatusOK, `{}`), nil
-			case "/backend-api/sentinel/req":
-				return registerJSONResponse(req, http.StatusOK, `{"token":"challenge-token","proofofwork":{"required":false}}`), nil
-			case "/api/accounts/authorize/continue":
-				sequence = append(sequence, "email")
-				var body map[string]any
-				if err := json.NewDecoder(req.Body).Decode(&body); err != nil {
-					t.Fatalf("decode authorize/continue body: %v", err)
-				}
-				username := body["username"].(map[string]any)
-				if username["kind"] != "email" || username["value"] != "user@example.test" {
-					t.Fatalf("authorize/continue body = %#v", body)
-				}
-				return registerJSONResponse(req, http.StatusOK, `{}`), nil
-			case "/api/accounts/password/verify":
-				sequence = append(sequence, "password")
-				return registerJSONResponse(req, http.StatusOK, `{"continue_url":"`+registerPlatformOAuthRedirectURI+`?code=callback-code&state=state"}`), nil
-			case "/auth/callback":
-				sequence = append(sequence, "callback")
-				return registerJSONResponse(req, http.StatusOK, `{}`), nil
-			case "/oauth/token":
-				sequence = append(sequence, "token")
-				return registerJSONResponse(req, http.StatusOK, `{"access_token":"access","refresh_token":"refresh","id_token":"id"}`), nil
-			default:
+			if req.URL.Path != "/api/accounts/oauth/token" {
 				t.Fatalf("unexpected request path: %s", req.URL.Path)
-				return nil, nil
 			}
+			if got := req.Header.Get("auth0-client"); got != registerPlatformAuth0Client {
+				t.Fatalf("auth0-client header = %q", got)
+			}
+			var body map[string]any
+			if err := json.NewDecoder(req.Body).Decode(&body); err != nil {
+				t.Fatalf("decode body: %v", err)
+			}
+			if body["code"] != "auth-code-123" {
+				t.Fatalf("body.code = %q", body["code"])
+			}
+			if body["code_verifier"] != "test-verifier" {
+				t.Fatalf("body.code_verifier = %q", body["code_verifier"])
+			}
+			return registerJSONResponse(req, http.StatusOK, `{"access_token":"access","refresh_token":"refresh","id_token":"id"}`), nil
 		})},
 	}
 
-	tokens, err := worker.loginAndExchangeTokens(context.Background(), "user@example.test", "Password123!", map[string]any{"address": "user@example.test"})
+	tokens, err := worker.exchangeRegistrationTokens(context.Background(), "auth-code-123")
 	if err != nil {
-		t.Fatalf("loginAndExchangeTokens() error = %v", err)
+		t.Fatalf("exchangeRegistrationTokens() error = %v", err)
 	}
 	if tokens["access_token"] != "access" || tokens["refresh_token"] != "refresh" || tokens["id_token"] != "id" {
 		t.Fatalf("tokens = %#v", tokens)
 	}
-	want := []string{"authorize", "email", "password", "callback", "token"}
-	if strings.Join(sequence, ",") != strings.Join(want, ",") {
-		t.Fatalf("request sequence = %#v, want %#v", sequence, want)
+}
+
+func TestRegisterIsCloudflareChallengeDetectsCloudflare(t *testing.T) {
+	if !registerIsCloudflareChallenge(map[string]any{"server": "cloudflare"}) {
+		t.Fatal("cloudflare server header not detected")
+	}
+	if !registerIsCloudflareChallenge(map[string]any{"body": "<title>Just a moment"}) {
+		t.Fatal("cloudflare challenge page not detected")
+	}
+	if !registerIsCloudflareChallenge(map[string]any{"body": "challenges.cloudflare.com"}) {
+		t.Fatal("cloudflare challenge URL not detected")
+	}
+	if registerIsCloudflareChallenge(map[string]any{"body": "normal page"}) {
+		t.Fatal("normal page falsely detected as cloudflare")
 	}
 }
 

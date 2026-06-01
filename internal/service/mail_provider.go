@@ -3,7 +3,6 @@ package service
 import (
 	"context"
 	"crypto/sha1"
-	"crypto/tls"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
@@ -14,6 +13,8 @@ import (
 	"mime/quotedprintable"
 	"net/http"
 	"net/mail"
+	"os"
+	"path/filepath"
 	"net/url"
 	"regexp"
 	"sort"
@@ -91,6 +92,30 @@ type registerYYDSMailProvider struct {
 	entry map[string]any
 }
 
+type registerDDGMailProvider struct {
+	registerHTTPMailProvider
+	entry map[string]any
+	label string
+}
+
+type registerCloudMailGenProvider struct {
+	registerHTTPMailProvider
+	entry map[string]any
+}
+
+var (
+	ddgAliasesMu   sync.Mutex
+	ddgAliasesFile string
+
+	cloudMailTokenMu   sync.Mutex
+	cloudMailTokenCache = map[string]cloudMailCacheEntry{}
+)
+
+type cloudMailCacheEntry struct {
+	token     string
+	expiresAt time.Time
+}
+
 func createRegisterMailbox(mailConfig map[string]any, username string) (map[string]any, error) {
 	provider, err := createRegisterMailProvider(mailConfig, "", "")
 	if err != nil {
@@ -152,6 +177,10 @@ func createRegisterMailProvider(mailConfig map[string]any, providerName, provide
 		return &registerInbucketMailProvider{registerHTTPMailProvider: base, entry: entry}, nil
 	case "yyds_mail":
 		return &registerYYDSMailProvider{registerHTTPMailProvider: base, entry: entry}, nil
+	case "ddg_mail":
+		return &registerDDGMailProvider{registerHTTPMailProvider: base, entry: entry, label: firstNonEmpty(util.Clean(entry["label"]), "ddg_mail")}, nil
+	case "cloudmail_gen":
+		return &registerCloudMailGenProvider{registerHTTPMailProvider: base, entry: entry}, nil
 	default:
 		return nil, fmt.Errorf("unsupported mail.provider: %s", util.Clean(entry["type"]))
 	}
@@ -170,15 +199,7 @@ func registerMailHTTPClient(timeout time.Duration) *http.Client {
 	if timeout <= 0 {
 		timeout = 15 * time.Second
 	}
-	return &http.Client{
-		Timeout: timeout,
-		Transport: &http.Transport{
-			Proxy: http.ProxyFromEnvironment,
-			TLSClientConfig: &tls.Config{
-				MinVersion: tls.VersionTLS12,
-			},
-		},
-	}
+	return browserHTTPClient("", timeout)
 }
 
 func registerMailEntries(mailConfig map[string]any) []map[string]any {
@@ -1208,6 +1229,398 @@ func yydsMailItems(data any) []map[string]any {
 	default:
 		return nil
 	}
+}
+
+func setDDGAliasesFile(dataDir string) {
+	ddgAliasesFile = dataDir + "/ddg_aliases.json"
+}
+
+func loadDDGAliases() map[string]struct{} {
+	set := map[string]struct{}{}
+	if ddgAliasesFile == "" {
+		return set
+	}
+	data, err := os.ReadFile(ddgAliasesFile)
+	if err != nil {
+		return set
+	}
+	var raw any
+	if json.Unmarshal(data, &raw) != nil {
+		return set
+	}
+	items, ok := raw.([]any)
+	if !ok {
+		return set
+	}
+	seen := map[string]struct{}{}
+	for _, item := range items {
+		if addr, ok := item.(string); ok && strings.TrimSpace(addr) != "" {
+			addr = strings.ToLower(strings.TrimSpace(addr))
+			if _, dup := seen[addr]; !dup {
+				seen[addr] = struct{}{}
+				set[addr] = seen[addr]
+			}
+		}
+	}
+	return set
+}
+
+func saveDDGAlias(address string) {
+	if ddgAliasesFile == "" {
+		return
+	}
+	ddgAliasesMu.Lock()
+	defer ddgAliasesMu.Unlock()
+
+	aliases := loadDDGAliases()
+	aliases[strings.ToLower(strings.TrimSpace(address))] = struct{}{}
+
+	items := make([]string, 0, len(aliases))
+	for alias := range aliases {
+		items = append(items, alias)
+	}
+	sort.Strings(items)
+
+	data, err := json.Marshal(items)
+	if err != nil {
+		return
+	}
+	dir := filepath.Dir(ddgAliasesFile)
+	_ = os.MkdirAll(dir, 0o755)
+	_ = os.WriteFile(ddgAliasesFile, append(data, '\n'), 0o644)
+}
+
+func isDDGAliasDuplicate(address string) bool {
+	target := strings.ToLower(strings.TrimSpace(address))
+	if target == "" {
+		return false
+	}
+	ddgAliasesMu.Lock()
+	defer ddgAliasesMu.Unlock()
+	_, ok := loadDDGAliases()[target]
+	return ok
+}
+
+func (p *registerDDGMailProvider) CreateMailbox(username string) (map[string]any, error) {
+	ddgToken := util.Clean(p.entry["ddg_token"])
+	if ddgToken == "" {
+		return nil, fmt.Errorf("DDGMail requires ddg_token")
+	}
+	cfInboxJWT := util.Clean(p.entry["cf_inbox_jwt"])
+	if cfInboxJWT == "" {
+		return nil, fmt.Errorf("DDGMail requires cf_inbox_jwt")
+	}
+
+	ddgData, err := registerMailRequestJSON(p.client, http.MethodPost, "https://quack.duckduckgo.com/api/email/addresses",
+		map[string]string{
+			"Authorization": "Bearer " + ddgToken,
+			"Content-Type":  "application/json",
+			"User-Agent":    p.conf.UserAgent,
+		}, nil, map[string]any{}, http.StatusOK, http.StatusCreated)
+	if err != nil {
+		return nil, fmt.Errorf("DDG API request failed: %w", err)
+	}
+	addressPart := util.Clean(ddgData["address"])
+	if addressPart == "" {
+		return nil, fmt.Errorf("DDG API response missing address field")
+	}
+	ddgAddress := addressPart + "@duck.com"
+
+	if isDDGAliasDuplicate(ddgAddress) {
+		return nil, fmt.Errorf("[%s] DDG日上限已达，别名 %s 已存在，自动切换邮箱提供商", p.label, ddgAddress)
+	}
+	saveDDGAlias(ddgAddress)
+
+	return map[string]any{
+		"provider":     "ddg_mail",
+		"provider_ref": p.entry["provider_ref"],
+		"address":      ddgAddress,
+		"token":        cfInboxJWT,
+		"label":        p.label,
+	}, nil
+}
+
+func (p *registerDDGMailProvider) FetchLatestMessage(mailbox map[string]any) (map[string]any, error) {
+	targetAddress := strings.ToLower(strings.TrimSpace(util.Clean(mailbox["address"])))
+	token := util.Clean(mailbox["token"])
+	cfAPIBase := strings.TrimRight(util.Clean(p.entry["api_base"]), "/")
+	if cfAPIBase == "" {
+		cfAPIBase = strings.TrimRight(util.Clean(p.entry["cf_api_base"]), "/")
+	}
+	messagesPath := util.Clean(p.entry["cf_messages_path"])
+	if messagesPath == "" {
+		messagesPath = "/api/mails"
+	}
+	if cfAPIBase == "" {
+		return nil, nil
+	}
+
+	cfHeaders := map[string]string{
+		"Authorization": "Bearer " + token,
+		"User-Agent":    p.conf.UserAgent,
+	}
+	cfAPIKey := util.Clean(p.entry["cf_api_key"])
+	if cfAPIKey != "" {
+		authMode := util.Clean(p.entry["cf_auth_mode"])
+		switch authMode {
+		case "query-key":
+			delete(cfHeaders, "Authorization")
+		default:
+			cfHeaders["X-API-Key"] = cfAPIKey
+		}
+	}
+	cfAdminPassword := util.Clean(p.entry["admin_password"])
+	if cfAdminPassword != "" {
+		cfHeaders["x-admin-auth"] = cfAdminPassword
+	}
+
+	data, err := registerMailRequestAny(p.client, http.MethodGet, cfAPIBase+messagesPath, cfHeaders,
+		map[string]string{"limit": "30", "offset": "0"}, nil, http.StatusOK)
+	if err != nil {
+		return nil, nil
+	}
+
+	rawList := registerDDGCFListPayload(data)
+	var messages []map[string]any
+	for _, item := range rawList {
+		if dict, ok := item.(map[string]any); ok {
+			messages = append(messages, dict)
+		}
+	}
+	if len(messages) == 0 {
+		return nil, nil
+	}
+
+	for _, message := range messages {
+		rawText := util.Clean(firstNonNil(message["raw"]))
+		rawRecipient := registerDDGParseRawRecipient(rawText)
+		if targetAddress != "" && rawRecipient != "" && !strings.Contains(rawRecipient, targetAddress) {
+			continue
+		}
+		textContent, htmlContent := extractRegisterMailContent(message)
+		subject := util.Clean(message["subject"])
+		sender := util.Clean(firstNonNil(message["from"], message["sender"], message["source"]))
+		if senderMap, ok := firstNonNil(message["from"], message["sender"]).(map[string]any); ok {
+			sender = firstNonEmpty(util.Clean(senderMap["address"]), util.Clean(senderMap["email"]), util.Clean(senderMap["name"]))
+		}
+		if rawText != "" && (stringOrEmpty(subject, sender) == "") {
+			if parsed, parseErr := mail.ReadMessage(strings.NewReader(rawText)); parseErr == nil {
+				if parsed.Header.Get("Subject") != "" && subject == "" {
+					subject = parsed.Header.Get("Subject")
+				}
+				if parsed.Header.Get("From") != "" && sender == "" {
+					sender = parsed.Header.Get("From")
+				}
+			}
+		}
+		return map[string]any{
+			"provider":     "ddg_mail",
+			"mailbox":      util.Clean(mailbox["address"]),
+			"message_id":   firstNonEmpty(util.Clean(message["id"]), util.Clean(message["msgid"]), util.Clean(message["_id"])),
+			"subject":      subject,
+			"sender":       sender,
+			"text_content": textContent,
+			"html_content": htmlContent,
+			"received_at":  firstNonNil(message["createdAt"], message["created_at"], message["receivedAt"], message["date"], message["timestamp"]),
+			"raw":          message,
+		}, nil
+	}
+	return nil, nil
+}
+
+func (p *registerDDGMailProvider) Close() {
+	p.registerHTTPMailProvider.Close()
+}
+
+func registerDDGCFListPayload(data any) []any {
+	switch typed := data.(type) {
+	case []any:
+		return typed
+	case map[string]any:
+		for _, key := range []string{"results", "hydra:member", "data", "messages"} {
+			if value, ok := typed[key]; ok {
+				switch typed2 := value.(type) {
+				case []any:
+					return typed2
+				case map[string]any:
+					if msg, ok := typed2["messages"]; ok {
+						if msgList, ok := msg.([]any); ok {
+							return msgList
+						}
+					}
+				}
+			}
+		}
+	}
+	return nil
+}
+
+func registerDDGParseRawRecipient(rawText string) string {
+	if rawText == "" {
+		return ""
+	}
+	re := regexp.MustCompile(`(?im)^To:\s*(.+?)$`)
+	match := re.FindStringSubmatch(rawText)
+	if match != nil {
+		addr := strings.TrimSpace(regexp.MustCompile(`\s*<[^>]*>`).ReplaceAllString(match[1], ""))
+		return strings.ToLower(addr)
+	}
+	parsed, err := mail.ReadMessage(strings.NewReader(rawText))
+	if err != nil {
+		return ""
+	}
+	return strings.ToLower(strings.TrimSpace(parsed.Header.Get("To")))
+}
+
+func (p *registerCloudMailGenProvider) CreateMailbox(username string) (map[string]any, error) {
+	domains := util.AsStringSlice(p.entry["domain"])
+	if len(domains) == 0 {
+		return nil, fmt.Errorf("CloudMailGen requires at least one domain")
+	}
+	domain, err := nextRegisterDomain(domains)
+	if err != nil {
+		return nil, err
+	}
+	subdomains := util.AsStringSlice(p.entry["subdomain"])
+	if len(subdomains) > 0 {
+		domain = subdomains[rand.Intn(len(subdomains))] + "." + domain
+	}
+	var localPart string
+	if uname := strings.TrimSpace(username); uname != "" {
+		localPart = uname
+	} else if prefix := util.Clean(p.entry["email_prefix"]); prefix != "" {
+		localPart = prefix + "_" + registerRandomAlphaNum(6)
+	} else {
+		localPart = registerRandomMailboxName()
+	}
+	address := localPart + "@" + domain
+	return map[string]any{
+		"provider":     "cloudmail_gen",
+		"provider_ref": p.entry["provider_ref"],
+		"address":      address,
+	}, nil
+}
+
+func (p *registerCloudMailGenProvider) FetchLatestMessage(mailbox map[string]any) (map[string]any, error) {
+	address := util.Clean(mailbox["address"])
+	if address == "" {
+		return nil, nil
+	}
+	token, err := cloudMailGenGetToken(p.entry, &p.registerHTTPMailProvider)
+	if err != nil {
+		return nil, err
+	}
+	apiBase := strings.TrimRight(util.Clean(p.entry["api_base"]), "/")
+	data, err := registerMailRequestAny(p.client, http.MethodPost, apiBase+"/api/public/emailList",
+		map[string]string{
+			"Authorization": token,
+			"Content-Type":  "application/json",
+			"User-Agent":    p.conf.UserAgent,
+		}, nil, map[string]any{
+			"toEmail":  address,
+			"size":     20,
+			"timeSort": "desc",
+		}, http.StatusOK)
+	if err != nil {
+		return nil, nil
+	}
+	result, ok := data.(map[string]any)
+	if !ok || result["code"] != float64(200) {
+		return nil, nil
+	}
+	items := util.AsMapSlice(result["data"])
+	messages := make([]map[string]any, 0, len(items))
+	for _, item := range items {
+		if registerMessageMatchesEmail(item, address) {
+			messages = append(messages, item)
+		}
+	}
+	if len(messages) == 0 {
+		return nil, nil
+	}
+	message := latestRegisterMailMessage(messages)
+	textContent, htmlContent := extractRegisterMailContent(message)
+	return map[string]any{
+		"provider":     "cloudmail_gen",
+		"mailbox":      address,
+		"message_id":   firstNonEmpty(util.Clean(message["id"]), util.Clean(message["_id"]), util.Clean(message["messageId"])),
+		"subject":      util.Clean(message["subject"]),
+		"sender":       firstNonEmpty(util.Clean(message["from"]), util.Clean(message["sender"])),
+		"text_content": textContent,
+		"html_content": htmlContent,
+		"received_at":  firstNonNil(message["createdAt"], message["created_at"], message["receivedAt"], message["date"], message["timestamp"]),
+		"to":           firstNonNil(message["to"], message["toEmail"], message["mailTo"]),
+		"raw":          message,
+	}, nil
+}
+
+func (p *registerCloudMailGenProvider) Close() {
+	p.registerHTTPMailProvider.Close()
+}
+
+func cloudMailGenGetToken(entry map[string]any, base *registerHTTPMailProvider) (string, error) {
+	adminEmail := util.Clean(entry["admin_email"])
+	adminPassword := util.Clean(entry["admin_password"])
+	if adminEmail == "" || adminPassword == "" {
+		return "", fmt.Errorf("CloudMailGen requires admin_email and admin_password")
+	}
+	apiBase := strings.TrimRight(util.Clean(entry["api_base"]), "/")
+	cacheKey := apiBase + "|" + adminEmail
+
+	cloudMailTokenMu.Lock()
+	cached, exists := cloudMailTokenCache[cacheKey]
+	cloudMailTokenMu.Unlock()
+	if exists && time.Now().Before(cached.expiresAt.Add(-5*time.Minute)) {
+		return cached.token, nil
+	}
+
+	data, err := registerMailRequestAny(base.client, http.MethodPost, apiBase+"/api/public/genToken",
+		map[string]string{
+			"Content-Type": "application/json",
+			"User-Agent":   base.conf.UserAgent,
+		}, nil, map[string]any{
+			"email":    adminEmail,
+			"password": adminPassword,
+		}, http.StatusOK)
+	if err != nil {
+		return "", err
+	}
+	result, ok := data.(map[string]any)
+	if !ok {
+		return "", fmt.Errorf("CloudMailGen genToken unexpected response")
+	}
+	token := ""
+	if result["code"] == float64(200) {
+		if dataSection, ok2 := result["data"].(map[string]any); ok2 {
+			token = util.Clean(dataSection["token"])
+		}
+	}
+	if token == "" {
+		return "", fmt.Errorf("CloudMailGen genToken returned no token")
+	}
+
+	cloudMailTokenMu.Lock()
+	cloudMailTokenCache[cacheKey] = cloudMailCacheEntry{token: token, expiresAt: time.Now().Add(24 * time.Hour)}
+	cloudMailTokenMu.Unlock()
+	return token, nil
+}
+
+func stringOrEmpty(parts ...string) string {
+	for _, part := range parts {
+		if strings.TrimSpace(part) != "" {
+			return part
+		}
+	}
+	return ""
+}
+
+func registerRandomAlphaNum(length int) string {
+	const chars = "abcdefghijklmnopqrstuvwxyz0123456789"
+	var builder strings.Builder
+	for i := 0; i < length; i++ {
+		builder.WriteByte(chars[rand.Intn(len(chars))])
+	}
+	return builder.String()
 }
 
 func duckMailItems(data any) []map[string]any {
