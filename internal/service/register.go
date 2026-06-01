@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"io"
 	"math"
+	"os/exec"
 	mathrand "math/rand"
 	"net/http"
 	"net/url"
@@ -305,6 +306,22 @@ func (w *registerWorker) close() {
 	}
 }
 
+func (w *registerWorker) runPython(phase string, args ...string) (map[string]any, error) {
+	cmd := exec.Command("python3", append([]string{"/opt/register_helper.py", phase}, args...)...)
+	output, err := cmd.Output()
+	if err != nil {
+		if exitErr, ok := err.(*exec.ExitError); ok {
+			return nil, fmt.Errorf("python %s failed: %s", phase, string(exitErr.Stderr))
+		}
+		return nil, fmt.Errorf("python %s: %w", phase, err)
+	}
+	var result map[string]any
+	if err := json.Unmarshal(output, &result); err != nil {
+		return nil, fmt.Errorf("python %s output invalid: %w", phase, err)
+	}
+	return result, nil
+}
+
 func (w *registerWorker) run(ctx context.Context) (map[string]any, error) {
 	w.step("开始创建邮箱")
 	mailbox, err := createRegisterMailbox(w.mail, "")
@@ -318,16 +335,21 @@ func (w *registerWorker) run(ctx context.Context) (map[string]any, error) {
 	w.step("邮箱创建完成: " + email)
 	password := registerRandomPassword(16)
 	firstName, lastName := registerRandomName()
-	if err := w.platformAuthorize(ctx, email); err != nil {
+	birthdate := registerRandomBirthdate()
+	proxy := util.Clean(w.config["proxy"])
+
+	// Use Python curl_cffi helper for OpenAI interaction
+	w.step("调用 Python 注册脚本 phase1")
+	phase1Result, err := w.runPython("phase1", email, password, proxy)
+	if err != nil {
 		return nil, err
 	}
-	if err := w.registerUser(ctx, email, password); err != nil {
-		return nil, err
+	if errText := util.Clean(phase1Result["error"]); errText != "" {
+		return nil, fmt.Errorf("phase1: %s", errText)
 	}
-	if err := w.sendOTP(ctx); err != nil {
-		return nil, err
-	}
-	w.step("开始等待注册验证码")
+	deviceID := util.Clean(phase1Result["device_id"])
+	codeVerifier := util.Clean(phase1Result["code_verifier"])
+	w.step("phase1 完成，等待注册验证码")
 	code, err := waitRegisterCode(ctx, w.mail, mailbox)
 	if err != nil {
 		return nil, err
@@ -336,21 +358,18 @@ func (w *registerWorker) run(ctx context.Context) (map[string]any, error) {
 		return nil, fmt.Errorf("waiting for register verification code timed out")
 	}
 	w.step("收到注册验证码: " + code)
-	if err := w.validateOTP(ctx, code); err != nil {
-		return nil, err
-	}
-	authCode, err := w.createAccount(ctx, firstName+" "+lastName, registerRandomBirthdate())
+	w.step("调用 Python 注册脚本 phase2")
+	phase2Result, err := w.runPython("phase2", deviceID, codeVerifier, email, password, firstName+" "+lastName, birthdate, code, proxy)
 	if err != nil {
 		return nil, err
 	}
-	tokens, err := w.exchangeRegistrationTokens(ctx, authCode)
-	if err != nil {
-		return nil, err
+	if errText := util.Clean(phase2Result["error"]); errText != "" {
+		return nil, fmt.Errorf("phase2: %s", errText)
 	}
-	tokens["email"] = email
-	tokens["password"] = password
-	tokens["created_at"] = util.NowISO()
-	return tokens, nil
+	phase2Result["email"] = email
+	phase2Result["password"] = password
+	phase2Result["created_at"] = util.NowISO()
+	return phase2Result, nil
 }
 
 func registerAuthorizeErrorDetail(payload map[string]any) string {
